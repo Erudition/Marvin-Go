@@ -1,7 +1,3 @@
-
-
-
-
 import { Task, TaskStatus, Category, Label, SyncConfig } from '../types';
 
 // Use a public CORS proxy to bypass browser restrictions in the sandbox.
@@ -96,7 +92,7 @@ export class MarvinClient {
     this.isSyncing = true;
     this.abortController = new AbortController();
 
-    console.log("[MARVIN SYNC] Starting real-time sync...");
+    console.log("[MARVIN SYNC] Starting real-time sync (polling)...");
     
     // Start from 'now' to receive only new changes since the app loaded
     let since = 'now'; 
@@ -108,9 +104,9 @@ export class MarvinClient {
     while (this.isSyncing) {
         try {
             const signal = this.abortController.signal;
-            const changesUrl = `${PROXY_PREFIX}${cleanServer}/${database}/_changes?style=all_docs&feed=longpoll&heartbeat=10000&filter=app%2FnoArchive&since=${since}&limit=499`;
+            // Use normal feed (short polling) to avoid proxy timeouts/truncation errors
+            const changesUrl = `${PROXY_PREFIX}${cleanServer}/${database}/_changes?style=all_docs&filter=app%2FnoArchive&since=${since}&limit=100`;
             
-            console.log(`[MARVIN SYNC] Long polling: ${since}`);
             const response = await fetch(changesUrl, {
                 headers: this.syncAuthHeaders,
                 signal
@@ -126,8 +122,17 @@ export class MarvinClient {
                 throw new Error(`Changes feed error: ${response.status}`);
             }
 
-            const data = await response.json();
-            since = data.last_seq; // Update cursor
+            const text = await response.text();
+            if (!text) {
+                 await new Promise(resolve => setTimeout(resolve, 3000));
+                 continue;
+            }
+
+            const data = JSON.parse(text);
+            
+            if (data.last_seq) {
+                 since = data.last_seq; 
+            }
 
             if (data.results && data.results.length > 0) {
                 const results = data.results as any[];
@@ -145,12 +150,16 @@ export class MarvinClient {
                     onDocsUpdate(docs);
                 }
             }
+            
+            // Polling delay (3 seconds)
+            await new Promise(resolve => setTimeout(resolve, 3000));
+
         } catch (e: any) {
             if (e.name === 'AbortError') {
                 console.log("[MARVIN SYNC] Sync aborted.");
                 break;
             }
-            console.error("[MARVIN SYNC] Error in sync loop, retrying in 5s...", e);
+            console.warn("[MARVIN SYNC] Error in sync loop, retrying in 5s...", e instanceof Error ? e.message : e);
             await new Promise(resolve => setTimeout(resolve, 5000));
         }
     }
@@ -232,16 +241,36 @@ export class MarvinClient {
 
   // --- CRUD Methods ---
 
-  async createTask(title: string, parentId?: string): Promise<any> {
+  async createTask(title: string, parentId?: string, timeEstimate?: number): Promise<any> {
     const timezoneOffset = -new Date().getTimezoneOffset();
+    const body: any = {
+        title,
+        parentId: parentId || 'unassigned',
+        day: null,
+        timeZoneOffset: timezoneOffset
+    };
+    if (timeEstimate) {
+        body.timeEstimate = timeEstimate;
+    }
+
     return this.request('/addTask', {
+      method: 'POST',
+      headers: this.apiHeaders,
+      body: JSON.stringify(body)
+    });
+  }
+
+  async createProject(title: string, parentId?: string): Promise<any> {
+    const timezoneOffset = -new Date().getTimezoneOffset();
+    return this.request('/addProject', {
       method: 'POST',
       headers: this.apiHeaders,
       body: JSON.stringify({
         title,
         parentId: parentId || 'unassigned',
         day: null,
-        timeZoneOffset: timezoneOffset
+        timeZoneOffset: timezoneOffset,
+        done: false
       })
     });
   }
@@ -351,6 +380,17 @@ export class MarvinClient {
     }
   }
 
+  async getProfile(): Promise<any> {
+    try {
+      return await this.request('/me', {
+        headers: this.apiHeaders
+      });
+    } catch (e) {
+      console.error("Failed to fetch profile", e);
+      return null;
+    }
+  }
+
   async getAllCategories(): Promise<Category[]> {
     try {
       const data = await this.request('/categories', {
@@ -388,7 +428,17 @@ export class MarvinClient {
   }
 
   public mapToTask(item: any): Task {
-    let totalMs = item.duration || 0;
+    // Determine time spent from times history if available (more reliable than duration for client-side sync)
+    let totalMs = 0;
+    
+    if (Array.isArray(item.times) && item.times.length > 0) {
+        for(let i=0; i < item.times.length - 1; i+=2) {
+            totalMs += (item.times[i+1] - item.times[i]);
+        }
+    } else {
+        totalMs = item.duration || 0;
+    }
+
     const timeSpentSeconds = Math.floor(totalMs / 1000);
 
     return {
@@ -398,6 +448,7 @@ export class MarvinClient {
       createdAt: item.createdAt,
       completedAt: item.completedAt || (item.done ? item.doneAt : undefined),
       timeSpent: timeSpentSeconds,
+      times: item.times || [],
       timeEstimate: item.timeEstimate,
       project: (item.parentId && item.parentId !== 'unassigned') ? item.parentId : undefined,
       note: item.note,
@@ -405,7 +456,9 @@ export class MarvinClient {
       db: item.db,
       type: item.type,
       day: item.day,
-      labelIds: item.labelIds
+      labelIds: item.labelIds,
+      backburner: item.backburner,
+      context: item.context // preserved if passed from context
     };
   }
 }

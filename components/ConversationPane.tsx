@@ -65,6 +65,7 @@ export const ConversationPane: React.FC<ConversationPaneProps> = ({ transcripts,
           transcripts.map((item) => {
             if (item.role === 'tool' && item.toolDetails) {
               const isExpanded = expandedTools[item.id];
+              const toolName = item.toolDetails.functionCalls?.[0]?.name || 'Tool';
               return (
                 <div key={item.id} className="bg-slate-800/50 rounded-lg border border-slate-700/50 overflow-hidden">
                   <button 
@@ -73,7 +74,7 @@ export const ConversationPane: React.FC<ConversationPaneProps> = ({ transcripts,
                   >
                      <div className="flex items-center space-x-2">
                        <Wrench size={14} className="text-purple-400" />
-                       <span>Used Tools ({item.toolDetails.functionCalls.length})</span>
+                       <span className="font-mono">{toolName}</span>
                      </div>
                      {isExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
                   </button>

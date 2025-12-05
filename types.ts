@@ -6,6 +6,7 @@ export enum TaskStatus {
   WAITING = 'WAITING',
   SOMEDAY = 'SOMEDAY',
   DONE = 'DONE',
+  BACKBURNER = 'BACKBURNER', // Added for UI Tab management
 }
 
 export interface Task {
@@ -15,6 +16,7 @@ export interface Task {
   createdAt: number;
   completedAt?: number;
   timeSpent: number; // in seconds (derived from task.times + duration)
+  times?: number[]; // Raw session timestamps [start, end, start, end...]
   timeEstimate?: number; // in milliseconds
   project?: string; // parentId
   context?: string; 
@@ -25,6 +27,7 @@ export interface Task {
   note?: string;
   day?: string;
   labelIds?: string[];
+  backburner?: boolean;
 }
 
 export interface Category {

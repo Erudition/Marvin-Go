@@ -31,6 +31,7 @@ export const useLiveClient = ({ apiKey, onToolCall, systemInstruction }: UseLive
   
   const audioBufferRef = useRef<Blob[]>([]);
   const isSessionOpenRef = useRef(false);
+  const sessionStartTimeRef = useRef<number>(0);
   
   // Track if the disconnect was initiated by the user
   const isUserDisconnectingRef = useRef(false);
@@ -39,10 +40,15 @@ export const useLiveClient = ({ apiKey, onToolCall, systemInstruction }: UseLive
   const retryTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const onToolCallRef = useRef(onToolCall);
+  const systemInstructionRef = useRef(systemInstruction);
   
   useEffect(() => {
     onToolCallRef.current = onToolCall;
   }, [onToolCall]);
+
+  useEffect(() => {
+    systemInstructionRef.current = systemInstruction;
+  }, [systemInstruction]);
 
   useEffect(() => {
     if (apiKey) {
@@ -202,7 +208,8 @@ export const useLiveClient = ({ apiKey, onToolCall, systemInstruction }: UseLive
             speechConfig: {
               voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Charon' } },
             },
-            systemInstruction: { parts: [{ text: systemInstruction || "You are a helpful assistant." }] },
+            // Use ref to always get fresh instruction/history during retries
+            systemInstruction: { parts: [{ text: systemInstructionRef.current || "You are a helpful assistant." }] },
             tools: [{ functionDeclarations: TOOLS }],
         };
         // Explicitly enable transcription with empty objects
@@ -219,6 +226,7 @@ export const useLiveClient = ({ apiKey, onToolCall, systemInstruction }: UseLive
                         console.log('Gemini Live Connected');
                         setConnectionState(ConnectionState.CONNECTED);
                         isSessionOpenRef.current = true;
+                        sessionStartTimeRef.current = Date.now();
                         
                         // Flush buffer
                         if (audioBufferRef.current.length > 0) {
@@ -356,13 +364,18 @@ export const useLiveClient = ({ apiKey, onToolCall, systemInstruction }: UseLive
                         sessionRef.current = null;
                         
                         if (!isUserDisconnectingRef.current) {
-                            console.log('Unexpected disconnect, attempting retry...');
                             playDisconnectSound();
-                            // Attempt to reconnect if this wasn't a manual disconnect
-                            const delays = [1000, 2000, 5000];
-                            const delay = attempt < delays.length ? delays[attempt] : 5000;
                             
-                            retryTimeoutRef.current = setTimeout(() => connectSocket(0), delay); 
+                            // Determine if we should reset retry attempt based on connection duration
+                            const sessionDuration = Date.now() - sessionStartTimeRef.current;
+                            const isStable = sessionDuration > 5000;
+                            const nextAttempt = isStable ? 0 : attempt + 1;
+                            
+                            const delays = [1000, 2000, 5000];
+                            const delay = nextAttempt < delays.length ? delays[nextAttempt] : 5000;
+                            
+                            console.log(`Unexpected disconnect (duration: ${sessionDuration}ms), attempting retry in ${delay}ms...`);
+                            retryTimeoutRef.current = setTimeout(() => connectSocket(nextAttempt), delay); 
                         }
                     },
                     onerror: (err) => {
@@ -372,6 +385,9 @@ export const useLiveClient = ({ apiKey, onToolCall, systemInstruction }: UseLive
 
                         if (!isUserDisconnectingRef.current) {
                              playDisconnectSound();
+                             
+                             // For error on start, we might want to limit retries, but for consistency with onclose,
+                             // we use similar backoff.
                              const delays = [1000, 2000, 5000];
                              if (attempt < 3) {
                                 const delay = delays[attempt];
@@ -407,7 +423,7 @@ export const useLiveClient = ({ apiKey, onToolCall, systemInstruction }: UseLive
     // Start the initial connection
     connectSocket(0);
 
-  }, [apiKey, disconnect, systemInstruction]); 
+  }, [apiKey, disconnect, systemInstruction, connectionState]); 
 
   const isPttPressedRef = useRef(isPttPressed);
   const voiceModeRef = useRef(voiceMode);

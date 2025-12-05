@@ -1,8 +1,3 @@
-
-
-
-
-
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { v4 as uuidv4 } from 'uuid';
 import { 
@@ -21,15 +16,16 @@ import { FocusBar } from './components/FocusBar';
 import { ConversationPane } from './components/ConversationPane';
 import { ChangesPane } from './components/ChangesPane';
 import { useLiveClient } from './hooks/useLiveClient';
-import { formatDurationCompact, getCurrentTimeStr } from './utils/time';
+import { formatDurationCompact, getCurrentTimeStr, parseNaturalLanguageTime, formatSessionHistory } from './utils/time';
 import { MarvinClient } from './utils/marvin';
 import { 
   Layout, CheckSquare, Inbox, Calendar as CalendarIcon, Archive, Plus, Mic, MicOff, 
   PanelLeftClose, PanelLeftOpen, MessageSquare, AlertCircle, History,
-  Sun, Cloud, CloudRain, CloudSnow, CloudLightning, CloudFog, Moon, Settings, Key, Database
+  Sun, Cloud, CloudRain, CloudSnow, CloudLightning, CloudFog, Moon, Settings, Key, Database,
+  CookingPot, ArrowUpDown
 } from 'lucide-react';
 
-const API_KEY = process.env.API_KEY || '';
+type SortOption = 'default' | 'title' | 'estimate' | 'duration' | 'created';
 
 const App: React.FC = () => {
   // --- Marvin Auth State ---
@@ -37,6 +33,9 @@ const App: React.FC = () => {
   const [apiToken, setApiToken] = useState<string>(() => localStorage.getItem('marvinApiToken') || 'm47dqHEwdJy56/j8tyAcXARlADg=');
   const [fullAccessToken, setFullAccessToken] = useState<string>(() => localStorage.getItem('marvinFullAccessToken') || '7o0b6/c0i+zXgWx5eheuM7Eob7w=');
   
+  // Gemini Auth State
+  const [geminiApiKey, setGeminiApiKey] = useState<string>(() => localStorage.getItem('geminiApiKey') || process.env.API_KEY || '');
+
   // Sync Credentials State
   const [syncServer, setSyncServer] = useState<string>(() => localStorage.getItem('marvinSyncServer') || 'https://512940bf-6e0c-4d7b-884b-9fc66185836b-bluemix.cloudant.com');
   const [syncDatabase, setSyncDatabase] = useState<string>(() => localStorage.getItem('marvinSyncDatabase') || 'u32410002');
@@ -61,8 +60,11 @@ const App: React.FC = () => {
   });
 
   const [changeLog, setChangeLog] = useState<ChangeLogEntry[]>([]);
-  const [activeTab, setActiveTab] = useState<TaskStatus | 'ALL'>(TaskStatus.INBOX);
+  const [activeTab, setActiveTab] = useState<TaskStatus>(TaskStatus.INBOX);
   const [manualInput, setManualInput] = useState('');
+  
+  const [sortBy, setSortBy] = useState<SortOption>('default');
+  const [showSortMenu, setShowSortMenu] = useState(false);
   
   // Layout State
   const [leftPanelOpen, setLeftPanelOpen] = useState(true);
@@ -90,8 +92,8 @@ const App: React.FC = () => {
   }, [apiToken, fullAccessToken, syncServer, syncDatabase, syncUser, syncPassword]);
 
   useEffect(() => {
-    // If we have tokens in storage (or defaults), try to init
-    if (apiToken) {
+    // If we have tokens in storage (or defaults), try to init. Ensure Gemini Key is present.
+    if (apiToken && geminiApiKey) {
         initClient();
         setIsAuthenticated(true);
         refreshTasks();
@@ -100,9 +102,10 @@ const App: React.FC = () => {
 
   const handleLogin = (e: React.FormEvent) => {
       e.preventDefault();
-      if (apiToken) {
+      if (apiToken && geminiApiKey) {
           localStorage.setItem('marvinApiToken', apiToken);
           localStorage.setItem('marvinFullAccessToken', fullAccessToken);
+          localStorage.setItem('geminiApiKey', geminiApiKey);
           
           localStorage.setItem('marvinSyncServer', syncServer);
           localStorage.setItem('marvinSyncDatabase', syncDatabase);
@@ -121,6 +124,7 @@ const App: React.FC = () => {
       }
       localStorage.removeItem('marvinApiToken');
       localStorage.removeItem('marvinFullAccessToken');
+      localStorage.removeItem('geminiApiKey');
       localStorage.removeItem('marvinSyncServer');
       localStorage.removeItem('marvinSyncDatabase');
       localStorage.removeItem('marvinSyncUser');
@@ -128,6 +132,7 @@ const App: React.FC = () => {
       
       setApiToken('');
       setFullAccessToken('');
+      setGeminiApiKey('');
       
       // Reset defaults for dev convenience upon logout/re-login interaction
       setSyncServer('https://512940bf-6e0c-4d7b-884b-9fc66185836b-bluemix.cloudant.com');
@@ -184,8 +189,11 @@ const App: React.FC = () => {
                       title: doc.title,
                       type: doc.type,
                       parentId: doc.parentId,
-                      color: doc.color
-                  };
+                      color: doc.color,
+                      backburner: doc.backburner,
+                      done: doc.done,
+                      doneDate: doc.doneDate,
+                  } as any;
               }
           });
           return categoriesUpdated ? newCats : prevCats;
@@ -226,11 +234,13 @@ const App: React.FC = () => {
   const refreshTasks = async () => {
       if (!marvinClientRef.current) return;
       try {
-          const [inbox, today, allCats, allLabels] = await Promise.all([
+          const [inbox, today, allCats, allLabels, profile, trackedItem] = await Promise.all([
               marvinClientRef.current.getInbox(),
               marvinClientRef.current.getToday(),
               marvinClientRef.current.getAllCategories(),
-              marvinClientRef.current.getLabels()
+              marvinClientRef.current.getLabels(),
+              marvinClientRef.current.getProfile(),
+              marvinClientRef.current.getTrackedItem()
           ]);
 
           // Build Categories Map (includes projects)
@@ -247,23 +257,37 @@ const App: React.FC = () => {
           const allTasks = [...today, ...inbox];
           // Remove duplicates based on ID (just in case)
           const uniqueTasks = Array.from(new Map(allTasks.map(item => [item.id, item])).values());
-          setTasks(uniqueTasks);
           
-          // Check for active tracker
-          const tracked = await marvinClientRef.current.getTrackedItem();
-          if (tracked && tracked._id) {
-             const now = Date.now();
-             const task = uniqueTasks.find(t => t.id === tracked._id);
+          // Check for active tracker using User Profile (which has authoritative start time)
+          if (profile && profile.tracking) {
+             const tId = profile.tracking;
+             let task = uniqueTasks.find(t => t.id === tId);
+             
+             // If currently tracked task isn't in inbox or today, try to use the one from getTrackedItem
+             if (!task && trackedItem && trackedItem._id === tId) {
+                 task = marvinClientRef.current.mapToTask(trackedItem);
+                 uniqueTasks.push(task); // Add to local list so it renders
+             }
+
              if (task) {
-                 if (timer.taskId !== tracked._id) {
-                     setTimer({ taskId: tracked._id, startTime: now, baseTime: task.timeSpent });
+                 if (timer.taskId !== tId) {
+                     setTimer({ 
+                         taskId: tId, 
+                         startTime: profile.trackingSince || Date.now(), 
+                         baseTime: task.timeSpent 
+                     });
                  }
              } else {
-                 setTimer({ taskId: tracked._id, startTime: now, baseTime: 0 }); 
+                 // Should technically fetch via ID if not returned by trackedItem (edge case), 
+                 // but trackedItem endpoint usually returns it if active.
+                 setTimer({ taskId: tId, startTime: profile.trackingSince || Date.now(), baseTime: 0 }); 
              }
           } else {
              setTimer({ taskId: null, startTime: null, baseTime: 0 });
           }
+
+          setTasks(uniqueTasks);
+          
       } catch (e) {
           console.error("Error refreshing tasks", e);
       }
@@ -333,25 +357,180 @@ Temperature: ${current.temperature_2m}°F
     fetchEnvData();
   }, []);
 
-  // 3. Combine Static Data with Dynamic App State
+  // 3. Helper for Context Minimization
+  const cleanForContext = (obj: any) => {
+    const res: any = {};
+    // Only keep essential fields and strip defaults/empty
+    if (obj.id) res.id = obj.id;
+    if (obj.title) res.title = obj.title;
+    if (obj.type && obj.type !== 'task') res.type = obj.type; // Tasks implied by position
+    
+    if (obj.timeEstimate && obj.timeEstimate > 0) res.est = Math.round(obj.timeEstimate / 60000) + 'm';
+    if (obj.timeSpent && obj.timeSpent > 0) res.tracked = Math.round(obj.timeSpent / 60) + 'm';
+    
+    if (obj.dueDate) res.due = obj.dueDate;
+    if (obj.note) res.note = obj.note.substring(0, 50); // Truncate notes
+
+    // Children arrays
+    if (obj.active && obj.active.length > 0) res.active = obj.active;
+    if (obj.backburner && obj.backburner.length > 0) res.backburner = obj.backburner;
+    if (obj.recentDone && obj.recentDone.length > 0) res.recentDone = obj.recentDone;
+    if (obj.oldDone && obj.oldDone.length > 0) res.oldDone = obj.oldDone;
+
+    return res;
+  };
+
+  // 4. Build Hierarchical Tree for Context
+  const buildContextTree = useCallback(() => {
+    // 1. Group all items by parentId
+    const childrenMap = new Map<string, any[]>();
+    
+    const addToMap = (pid: string, item: any) => {
+        const key = pid || 'unassigned';
+        if (!childrenMap.has(key)) childrenMap.set(key, []);
+        childrenMap.get(key)?.push(item);
+    };
+
+    // Add Categories & Projects
+    Object.values(categories).forEach(cat => {
+        // Normalize parentId: Main cats have 'root', others have IDs
+        // Orphaned items might have IDs not in map, effectively roots or unassigned.
+        addToMap(cat.parentId, { ...cat, kind: 'container' });
+    });
+
+    // Add Loaded Tasks
+    tasks.forEach(task => {
+        // Skip projects if they appear in tasks list (sync/api overlap)
+        if (task.type === 'project') return;
+        addToMap(task.project || 'unassigned', { ...task, kind: 'task' });
+    });
+
+    // 2. Recursive function to build tree node
+    const serializeNode = (nodeId: string): any => {
+        const items = childrenMap.get(nodeId) || [];
+        
+        const active: any[] = [];
+        const backburnerTitles: string[] = [];
+        const recentDone: any[] = [];
+        const oldDoneTitles: string[] = [];
+        
+        items.forEach(item => {
+            if (item.kind === 'task') {
+                // Process Task
+                // Tasks in 'tasks' list are usually active (Inbox/Today).
+                // If we eventually load done tasks, we might filter here.
+                // Assuming loaded tasks are active for now unless status=DONE
+                if (item.status === TaskStatus.DONE) return; // Skip done tasks in context unless requested?
+
+                // Tasks are leaves
+                active.push(cleanForContext(item));
+            } else {
+                // Process Category/Project
+                if (item.backburner && !item.done) {
+                    backburnerTitles.push(item.title);
+                } else if (item.done) {
+                    const doneTime = item.doneDate ? new Date(item.doneDate).getTime() : 0;
+                    const sevenDaysAgo = Date.now() - (7 * 24 * 60 * 60 * 1000);
+                    if (doneTime > sevenDaysAgo) {
+                         // Full object for recent done
+                         const node = cleanForContext(item);
+                         // Recurse? Usually done projects hide children, but maybe useful.
+                         // Let's keep it shallow for done projects to save tokens.
+                         recentDone.push(node);
+                    } else {
+                        oldDoneTitles.push(item.title);
+                    }
+                } else {
+                    // Active Category/Project
+                    const children = serializeNode(item.id);
+                    const node = cleanForContext({ ...item, ...children });
+                    active.push(node);
+                }
+            }
+        });
+        
+        const result: any = {};
+        if (active.length > 0) result.active = active;
+        if (backburnerTitles.length > 0) result.backburner = backburnerTitles;
+        if (recentDone.length > 0) result.recentDone = recentDone;
+        if (oldDoneTitles.length > 0) result.oldDone = oldDoneTitles;
+        
+        return result;
+    };
+
+    // 3. Build Root and Inbox
+    const rootStructure = serializeNode('root');
+    const inboxStructure = serializeNode('unassigned').active || []; // Inbox items usually in 'unassigned'
+
+    // Calculate total count for stats
+    const totalLoaded = Object.keys(categories).length + tasks.length;
+
+    return {
+        root: rootStructure,
+        inbox: inboxStructure,
+        totalCount: totalLoaded
+    };
+  }, [categories, tasks]);
+
+  // 5. Combine Static Data with Dynamic App State
   useEffect(() => {
+    const { 
+        root,
+        inbox,
+        totalCount
+    } = buildContextTree();
+    
+    // Explicit subset message
+    const subsetMsg = `Showing subset of ${totalCount} items loaded in memory. Tasks shown are limited to Inbox and Today/Active contexts. Projects/Categories are fully loaded. Use the 'search' tool to find items not visible here.`;
+
     const contextSnapshot = `
 --- MARVIN APP STATE SNAPSHOT ---
+Stats: ${subsetMsg}
 Active Timer Task ID: ${timer.taskId || "None"}
-Current Tasks (Subset):
-${JSON.stringify(tasks.slice(0, 50).map(t => ({
-    id: t.id, 
-    title: t.title, 
-    status: t.status, 
-    type: t.type,
-    timeSpent: t.timeSpent,
-    dueDate: t.dueDate,
-    project: t.project ? (categories[t.project]?.title || t.project) : undefined
-})), null, 2)}
+
+DATA STRUCTURE:
+{
+  "root": { 
+     "active": [ ...Recursive Tree... ],
+     "backburner": [ ...Titles... ],
+     "recentDone": [ ...Objects... ],
+     "oldDone": [ ...Titles... ]
+  },
+  "inbox": [ ...Flat list of tasks... ]
+}
+
+CURRENT STATE JSON:
+${JSON.stringify({
+    root,
+    inbox
+}, null, 2)}
+
 ----------------------------------
+IMPORTANT INSTRUCTION: 
+- The JSON above defines the project/category structure implicitly via nesting.
+- 'active' contains open tasks and projects.
+- 'backburner' contains titles of backburner projects.
+- 'recentDone' contains full objects of recently completed projects.
+- 'oldDone' contains titles of older completed projects.
+- When adding a task, guess the 'parentId' from the tree. If it doesn't fit, use 'unassigned'.
+- Guess 'timeEstimate' generously (in ms) if unknown.
 `;
-    setSystemInstruction(`${environmentInfo}\n${baseInstruction}\n${contextSnapshot}`);
-  }, [baseInstruction, environmentInfo, tasks, timer, categories]);
+
+    const history = transcripts
+      .slice(-15) // Keep last 15 turns for context
+      .map(t => {
+          if (t.role === 'user') return `User: ${t.text}`;
+          if (t.role === 'model') return `Model: ${t.text}`;
+          if (t.role === 'tool' && t.toolDetails) {
+              const calls = t.toolDetails.functionCalls.map(fc => `${fc.name}(${JSON.stringify(fc.args)})`).join(', ');
+              const responses = t.toolDetails.functionResponses?.map(fr => JSON.stringify(fr.response)).join(', ');
+              return `Tool Call: ${calls}\nTool Response: ${responses || 'Pending...'}`;
+          }
+          return '';
+      }).join('\n');
+
+    setSystemInstruction(`${environmentInfo}\n${baseInstruction}\n${contextSnapshot}\n\n--- CONVERSATION HISTORY (for context on reconnect) ---\n${history}`);
+  }, [baseInstruction, environmentInfo, timer, transcripts, buildContextTree]);
 
   // Persist Transcripts
   useEffect(() => { localStorage.setItem('transcripts', JSON.stringify(transcripts)); }, [transcripts]);
@@ -398,16 +577,44 @@ ${JSON.stringify(tasks.slice(0, 50).map(t => ({
 
   // --- Task Actions (Marvin API Wrappers) ---
 
-  const addTask = useCallback(async (title: string, reason?: string, actor: 'user' | 'ai' = 'user') => {
-    if (!marvinClientRef.current) return;
+  const addTask = useCallback(async (title: string, parentId?: string, timeEstimate?: number, reason?: string, actor: 'user' | 'ai' = 'user') => {
+    if (!marvinClientRef.current) return null;
     try {
-        await marvinClientRef.current.createTask(title);
-        logChange(actor, 'Add Task', `Added "${title}"`, reason);
+        const newTask = await marvinClientRef.current.createTask(title, parentId, timeEstimate);
+        const parentName = parentId && parentId !== 'unassigned' ? (categories[parentId]?.title || 'Unknown') : 'Inbox';
+        const est = timeEstimate ? ` (~${Math.round(timeEstimate / 60000)}m)` : '';
+        logChange(actor, 'Add Task', `Added "${title}" to ${parentName}${est}`, reason);
         // refreshTasks(); // Sync should handle this
+        return newTask;
     } catch (e) {
         console.error("Failed to add task", e);
+        return null;
     }
-  }, [logChange]);
+  }, [logChange, categories]);
+
+  const addProject = useCallback(async (title: string, parentId?: string, reason?: string, actor: 'user' | 'ai' = 'user') => {
+    if (!marvinClientRef.current) return;
+    try {
+        await marvinClientRef.current.createProject(title, parentId);
+        const parentName = parentId && parentId !== 'unassigned' ? (categories[parentId]?.title || 'Unknown') : 'Root';
+        logChange(actor, 'Add Project', `Added project "${title}" to ${parentName}`, reason);
+    } catch (e) {
+        console.error("Failed to add project", e);
+    }
+  }, [logChange, categories]);
+
+  const moveTask = useCallback(async (itemId: string, newParentId: string, reason?: string, actor: 'user' | 'ai' = 'user') => {
+    if (!marvinClientRef.current) return;
+    const task = tasks.find(t => t.id === itemId);
+    const newParent = categories[newParentId]?.title || (newParentId === 'unassigned' ? 'Inbox' : newParentId);
+    
+    try {
+        await marvinClientRef.current.updateDoc(itemId, { parentId: newParentId });
+        logChange(actor, 'Move Task', `Moved "${task?.title || 'task'}" to ${newParent}`, reason);
+    } catch (e) {
+        console.error("Failed to move task", e);
+    }
+  }, [tasks, categories, logChange]);
 
   const markDone = useCallback(async (id: string, reason?: string, actor: 'user' | 'ai' = 'user') => {
     if (!marvinClientRef.current) return;
@@ -436,6 +643,12 @@ ${JSON.stringify(tasks.slice(0, 50).map(t => ({
             // Tasks
             if (newDone) {
                 await marvinClientRef.current.markDone(id);
+                
+                // Stop timer locally if running on this task
+                if (timer.taskId === id) {
+                    setTimer({ taskId: null, startTime: null, baseTime: 0 });
+                }
+
                 // Optimistic update for tasks
                 setTasks(prev => prev.map(t => t.id === id ? { ...t, status: TaskStatus.DONE } : t));
                 logChange(actor, 'Complete Task', `Marked "${task.title}" done`, reason);
@@ -449,7 +662,7 @@ ${JSON.stringify(tasks.slice(0, 50).map(t => ({
     } catch (e) {
         console.error("Failed to mark done", e);
     }
-  }, [tasks, logChange, handleSyncDocs]);
+  }, [tasks, logChange, handleSyncDocs, timer.taskId]);
 
   const renameTask = useCallback(async (id: string, newTitle: string, reason?: string, actor: 'user' | 'ai' = 'user') => {
     if (!marvinClientRef.current) return;
@@ -476,6 +689,17 @@ ${JSON.stringify(tasks.slice(0, 50).map(t => ({
     }
   }, [tasks, timer, logChange]);
 
+  const updateTaskEstimate = useCallback(async (id: string, estimate: number) => {
+    if (!marvinClientRef.current) return;
+    try {
+        await marvinClientRef.current.updateDoc(id, { timeEstimate: estimate });
+        // Optimistic update
+        setTasks(prev => prev.map(t => t.id === id ? { ...t, timeEstimate: estimate } : t));
+    } catch (e) {
+        console.error("Failed to update estimate", e);
+    }
+  }, []);
+
   const toggleTimer = useCallback(async (id: string, reason?: string, actor: 'user' | 'ai' = 'user') => {
     if (!marvinClientRef.current) return;
     const task = tasks.find(t => t.id === id);
@@ -484,14 +708,58 @@ ${JSON.stringify(tasks.slice(0, 50).map(t => ({
         // Stop
         try {
             await marvinClientRef.current.stopTracking(id);
+            
+            // IMPORTANT: Manually update the document's time tracking history and duration.
+            // Marvin API's stopTracking returns the stop times, but the UI relies on the full document being updated.
+            // We calculate the new times array locally and push the update to ensure persistence.
+            if (task && timer.startTime) {
+                const now = Date.now();
+                const newTimes = [...(task.times || []), timer.startTime, now];
+                
+                // Calculate new cumulative duration
+                let newDuration = 0;
+                for(let i=0; i < newTimes.length - 1; i+=2) {
+                    newDuration += (newTimes[i+1] - newTimes[i]);
+                }
+
+                // Update local state immediately for UI responsiveness
+                setTasks(prev => prev.map(t => {
+                    if (t.id === id) {
+                        return { 
+                            ...t, 
+                            times: newTimes,
+                            timeSpent: Math.floor(newDuration / 1000)
+                        };
+                    }
+                    return t;
+                }));
+
+                // Persist to DB so it survives refresh
+                await marvinClientRef.current.updateDoc(id, { times: newTimes, duration: newDuration });
+            }
+
             logChange(actor, 'Stop Timer', 'Stopped timer', reason);
             setTimer({ taskId: null, startTime: null, baseTime: 0 });
         } catch(e) { console.error("Failed to stop timer", e); }
     } else {
         // Start
         try {
-            // Stop previous if any
-            if (timer.taskId) await marvinClientRef.current.stopTracking(timer.taskId);
+            // Stop previous if any (using the same logic to persist)
+            if (timer.taskId) {
+                const prevTask = tasks.find(t => t.id === timer.taskId);
+                await marvinClientRef.current.stopTracking(timer.taskId);
+                 if (prevTask && timer.startTime) {
+                    const now = Date.now();
+                    const newTimes = [...(prevTask.times || []), timer.startTime, now];
+                    
+                    let newDuration = 0;
+                    for(let i=0; i < newTimes.length - 1; i+=2) {
+                        newDuration += (newTimes[i+1] - newTimes[i]);
+                    }
+
+                    await marvinClientRef.current.updateDoc(timer.taskId, { times: newTimes, duration: newDuration });
+                }
+            }
             
             await marvinClientRef.current.startTracking(id);
             logChange(actor, 'Start Timer', `Started timer for "${task?.title || 'Unknown'}"`, reason);
@@ -504,7 +772,7 @@ ${JSON.stringify(tasks.slice(0, 50).map(t => ({
   const handleManualAdd = (e: React.FormEvent) => {
     e.preventDefault();
     if (manualInput.trim()) {
-      addTask(manualInput.trim(), 'Manual input via UI');
+      addTask(manualInput.trim(), 'unassigned', undefined, 'Manual input via UI');
       setManualInput('');
     }
   };
@@ -517,8 +785,31 @@ ${JSON.stringify(tasks.slice(0, 50).map(t => ({
 
     switch (name) {
       case 'addTask':
-        await addTask(args.title, args.reason, 'ai');
-        return { result: `Task "${args.title}" added to Marvin.` };
+        const createdTask = await addTask(args.title, args.parentId, args.timeEstimate, args.reason, 'ai');
+        if (createdTask) {
+            const missingFields = [];
+            if (!args.parentId || args.parentId === 'unassigned') missingFields.push('Project');
+            if (!args.timeEstimate) missingFields.push('Time Estimate');
+
+            let resultMsg = `Task created successfully with ID: ${createdTask._id}.`;
+            if (missingFields.length > 0) {
+                resultMsg += ` The following fields are unspecified: ${missingFields.join(', ')}.`;
+            }
+            return { result: resultMsg };
+        }
+        return { result: "Failed to add task." };
+
+      case 'addProject':
+        await addProject(args.title, args.parentId, args.reason, 'ai');
+        return { result: `Project "${args.title}" added.` };
+
+      case 'moveTask':
+        const taskToMove = tasks.find(t => t.id === args.itemId || t.title.toLowerCase().includes(args.itemId.toLowerCase()));
+        if (taskToMove) {
+            await moveTask(taskToMove.id, args.newParentId, args.reason, 'ai');
+            return { result: `Moved "${taskToMove.title}" to new parent.` };
+        }
+        return { result: "Task not found." };
 
       case 'renameTask':
         const taskToRename = tasks.find(t => t.id === args.itemId || t.title.toLowerCase().includes(args.itemId.toLowerCase()));
@@ -546,6 +837,24 @@ ${JSON.stringify(tasks.slice(0, 50).map(t => ({
             return `- ${t.title} [ID: ${t.id}]${projName ? ` (Project: ${projName})` : ''}`;
         }).join('\n');
         return { result: summary || "No tasks found." };
+      
+      case 'search':
+        const query = (args.query || '').toLowerCase();
+        const results = [];
+        // Search in local tasks
+        tasks.forEach(t => {
+            if (t.title.toLowerCase().includes(query)) {
+                results.push({ type: 'task', title: t.title, id: t.id, project: t.project });
+            }
+        });
+        // Search in local categories/projects
+        Object.values(categories).forEach(c => {
+             if (c.title.toLowerCase().includes(query)) {
+                 results.push({ type: c.type, title: c.title, id: c.id });
+             }
+        });
+        // Slice to avoid token overflow
+        return { result: JSON.stringify(results.slice(0, 25)) };
 
       case 'getCurrentTask':
         if (timer.taskId && timer.startTime) {
@@ -564,11 +873,103 @@ ${JSON.stringify(tasks.slice(0, 50).map(t => ({
         const taskToUpdate = tasks.find(t => 
           t.id === args.itemId || t.title.toLowerCase().includes(args.itemId.toLowerCase())
         );
-        if (taskToUpdate) {
-          await markDone(taskToUpdate.id, args.reason, 'ai');
-          return { result: `Task "${taskToUpdate.title}" marked as completed.` };
+        if (!taskToUpdate) return { result: "Task not found." };
+        
+        // 1. Check existing time if no explicit "since" is provided
+        // Calculate current total time including active timer if running
+        const activeSession = timer.taskId === taskToUpdate.id && timer.startTime 
+            ? (Date.now() - timer.startTime) / 1000 
+            : 0;
+        const totalTimeSeconds = taskToUpdate.timeSpent + activeSession;
+
+        // If very little time (<30s) and no 'since' logic provided (e.g. user didn't say when they did it),
+        // prompt for clarification. Note: 'since' is required in the tool definition now, so the model 
+        // should have asked or inferred 'now'. If 'now' is inferred and time is low, we still warn.
+        
+        let doneTime = Date.now();
+        let parsedSince = null;
+        if (args.since) {
+            parsedSince = parseNaturalLanguageTime(args.since);
+            if (parsedSince) doneTime = parsedSince;
         }
-        return { result: "Task not found." };
+
+        const isTimeVeryShort = totalTimeSeconds < 30;
+        // If the model defaulted to 'now' (implicit or explicit) and time is short, reject
+        if (isTimeVeryShort && (!args.since || args.since.toLowerCase() === 'now')) {
+            const history = formatSessionHistory(taskToUpdate.times);
+            return {
+                result: `Error: This task has very little tracked time (${formatDurationCompact(totalTimeSeconds)}). Please specify when you worked on it or how long it took (e.g. "since 10m ago" or "for 1h"). Current history: ${history}`
+            };
+        }
+
+        let message = `Task "${taskToUpdate.title}" marked as completed.`;
+
+        // 2. Handle Session Updates based on 'since'
+        if (timer.taskId === taskToUpdate.id) {
+            // Task was actively running.
+            // Stop it first.
+            await marvinClientRef.current?.stopTracking(taskToUpdate.id);
+            setTimer({ taskId: null, startTime: null, baseTime: 0 });
+
+            // If 'since' implies a time significantly different from now (> 1 minute),
+            // update the session we just stopped.
+            if (Math.abs(doneTime - Date.now()) > 60000) {
+                 // We need to retroactively fix the end time of the last session
+                 // Since we just stopped it, it should be the last pair in `times`
+                 // Fetch fresh to be safe, or just append locally and push update
+                 const currentTimes = [...(taskToUpdate.times || [])];
+                 // Add the session that stopTracking just added (approx 'now')
+                 // But we don't have the updated doc from stopTracking yet unless we wait for sync.
+                 // Better approach: Calculate the new times array entirely and overwrite.
+                 
+                 // If timer was running, start was timer.startTime.
+                 // We want session: [startTime, doneTime]
+                 if (timer.startTime) {
+                     currentTimes.push(timer.startTime);
+                     currentTimes.push(doneTime);
+                     await marvinClientRef.current?.updateDoc(taskToUpdate.id, { times: currentTimes });
+                     message += ` Active session adjusted to end at ${new Date(doneTime).toLocaleTimeString()}.`;
+                 }
+            } else {
+                 message += ` Tracking stopped.`;
+            }
+        } else {
+            // Task was NOT running.
+            // If the user said "since 10m ago", they imply they were working on it.
+            // We should add a session [doneTime - duration?, doneTime]? 
+            // The prompt says: "calculate whether the task was running at that time."
+            
+            // Check if this task had an open session? (Unlikely if timer.taskId !== id)
+            // Check if another task was running at doneTime?
+            const otherTask = tasks.find(t => {
+                if (!t.times) return false;
+                for (let i=0; i<t.times.length; i+=2) {
+                    const start = t.times[i];
+                    const end = t.times[i+1] || Date.now();
+                    if (doneTime >= start && doneTime <= end) return true;
+                }
+                return false;
+            });
+
+            if (otherTask) {
+                message += ` Warning: Task "${otherTask.title}" was tracked at that time.`;
+            } else {
+                 // If 'since' is in the past, maybe we should add a session?
+                 // Prompt doesn't explicitly ask to *add* a session if missing, 
+                 // just "modify the timetracking session so that it ends at that time".
+                 // This implies modifying an *existing* session.
+                 // If no session exists, we just mark done.
+            }
+        }
+
+        // 3. Mark Done
+        await markDone(taskToUpdate.id, args.reason, 'ai');
+        
+        // 4. Return history
+        // We need the updated times to show history accurately. 
+        // We'll approximate local update or use existing.
+        return { result: `${message} History: ${formatSessionHistory(taskToUpdate.times)}` };
+
 
       case 'startTimer':
          const taskToStart = tasks.find(t => 
@@ -595,13 +996,41 @@ ${JSON.stringify(tasks.slice(0, 50).map(t => ({
         }
         return { result: "No timer running." };
       
+      case 'getTaskSessions':
+        const taskForSessions = tasks.find(t => t.id === args.itemId);
+        if (!taskForSessions) return { result: "Task not found." };
+        return { result: `Sessions for "${taskForSessions.title}": ${formatSessionHistory(taskForSessions.times)}` };
+
+      case 'updateTaskSessions':
+        const taskToEdit = tasks.find(t => t.id === args.itemId);
+        if (!taskToEdit) return { result: "Task not found." };
+        
+        // Validate sessions
+        const newSessions: any[] = args.sessions || [];
+        for (const s of newSessions) {
+            if (s.start >= s.end) return { result: `Error: Invalid session [${s.start}, ${s.end}]. Start must be before end.` };
+        }
+        
+        // Flatten to times array [start, end, start, end...]
+        const flattenedTimes: number[] = [];
+        newSessions.forEach((s: any) => {
+            flattenedTimes.push(s.start);
+            flattenedTimes.push(s.end);
+        });
+
+        if (marvinClientRef.current) {
+            await marvinClientRef.current.updateDoc(taskToEdit.id, { times: flattenedTimes });
+            return { result: `Sessions updated for "${taskToEdit.title}". New history: ${formatSessionHistory(flattenedTimes)}` };
+        }
+        return { result: "Failed to update sessions." };
+
       case 'endSession':
         return { result: "Session ended." };
 
       default:
         return { result: "Tool not found." };
     }
-  }, [addTask, tasks, markDone, toggleTimer, timer, deleteTask, renameTask, categories]);
+  }, [addTask, addProject, moveTask, tasks, markDone, toggleTimer, timer, deleteTask, renameTask, categories, updateTaskEstimate]);
 
   const { 
     connect, 
@@ -614,7 +1043,7 @@ ${JSON.stringify(tasks.slice(0, 50).map(t => ({
     setIsPttPressed,
     error
   } = useLiveClient({ 
-    apiKey: API_KEY, 
+    apiKey: geminiApiKey, 
     onToolCall: handleToolCall,
     systemInstruction
   });
@@ -674,12 +1103,34 @@ ${JSON.stringify(tasks.slice(0, 50).map(t => ({
     return isDay ? <Sun size={24} className="text-amber-400" /> : <Moon size={24} className="text-indigo-300" />;
   };
 
+  // --- Filtering & Sorting ---
+
   const filteredTasks = tasks.filter(t => {
-    if (activeTab === 'ALL') return true;
-    // Map Marvin status to UI tabs
+    if (activeTab === TaskStatus.BACKBURNER) {
+        // Backburner items are explicitly marked OR inherited (inheritance not fully implemented here yet)
+        return t.backburner === true && !t.status.includes('DONE'); 
+    }
+    
+    // For other tabs, exclude explicit backburner items
+    if (t.backburner) return false;
+
     if (activeTab === TaskStatus.INBOX) return t.status === TaskStatus.INBOX;
     if (activeTab === TaskStatus.NEXT) return t.status === TaskStatus.NEXT;
     return false;
+  }).sort((a, b) => {
+      switch (sortBy) {
+          case 'title':
+              return a.title.localeCompare(b.title);
+          case 'estimate':
+              return (b.timeEstimate || 0) - (a.timeEstimate || 0);
+          case 'duration':
+              return b.timeSpent - a.timeSpent;
+          case 'created':
+              return b.createdAt - a.createdAt;
+          default:
+              // Default sort (approx rank)
+              return 0; 
+      }
   });
 
   const toggleRightPanel = (content: 'conversation' | 'changes') => {
@@ -724,13 +1175,24 @@ ${JSON.stringify(tasks.slice(0, 50).map(t => ({
                   <form onSubmit={handleLogin}>
                       <div className="space-y-4">
                         <div>
+                            <label className="block text-xs font-semibold text-slate-500 uppercase mb-2">Gemini API Key (Required)</label>
+                            <input 
+                              type="password" 
+                              value={geminiApiKey}
+                              onChange={(e) => setGeminiApiKey(e.target.value)}
+                              className="w-full bg-slate-950 border border-slate-700 rounded-lg px-4 py-3 text-slate-200 focus:border-blue-500 focus:outline-none"
+                              placeholder="Gemini API Key"
+                              required
+                            />
+                        </div>
+                        <div>
                             <label className="block text-xs font-semibold text-slate-500 uppercase mb-2">API Token (Required)</label>
                             <input 
                               type="password" 
                               value={apiToken}
                               onChange={(e) => setApiToken(e.target.value)}
                               className="w-full bg-slate-950 border border-slate-700 rounded-lg px-4 py-3 text-slate-200 focus:border-blue-500 focus:outline-none"
-                              placeholder="apiToken"
+                              placeholder="Marvin API Token"
                               required
                             />
                         </div>
@@ -795,7 +1257,7 @@ ${JSON.stringify(tasks.slice(0, 50).map(t => ({
 
                         <button 
                           type="submit" 
-                          disabled={!apiToken}
+                          disabled={!apiToken || !geminiApiKey}
                           className="w-full bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white font-semibold py-3 rounded-lg transition-colors mt-4"
                         >
                             Connect
@@ -882,8 +1344,9 @@ ${JSON.stringify(tasks.slice(0, 50).map(t => ({
             </div>
             <nav className="flex-1 px-4 py-2 space-y-2">
               {[
-                { id: TaskStatus.INBOX, icon: Inbox, label: 'Inbox', count: tasks.filter(t => t.status === TaskStatus.INBOX).length },
-                { id: TaskStatus.NEXT, icon: CheckSquare, label: 'Today', count: tasks.filter(t => t.status === TaskStatus.NEXT).length },
+                { id: TaskStatus.INBOX, icon: Inbox, label: 'Inbox', count: tasks.filter(t => t.status === TaskStatus.INBOX && !t.backburner).length },
+                { id: TaskStatus.NEXT, icon: CheckSquare, label: 'Today', count: tasks.filter(t => t.status === TaskStatus.NEXT && !t.backburner).length },
+                { id: TaskStatus.BACKBURNER, icon: CookingPot, label: 'Backburner', count: tasks.filter(t => t.backburner && !t.status.includes('DONE')).length },
               ].map(item => (
                 <button
                   key={item.id}
@@ -933,17 +1396,67 @@ ${JSON.stringify(tasks.slice(0, 50).map(t => ({
              </div>
 
              <div className="p-6 max-w-3xl mx-auto">
-               <h2 className="text-xl font-semibold mb-6 text-slate-200 capitalize flex items-center">
-                 {activeTab === TaskStatus.NEXT ? 'Today' : 'Inbox'}
-                 <span className="ml-2 text-xs bg-slate-800 text-slate-500 px-2 py-1 rounded-full font-normal">
-                    {filteredTasks.length}
-                 </span>
-               </h2>
+               <div className="flex items-center justify-between mb-6">
+                   <h2 className="text-xl font-semibold text-slate-200 capitalize flex items-center">
+                     {activeTab === TaskStatus.NEXT ? 'Today' : (activeTab === TaskStatus.BACKBURNER ? 'Backburner' : 'Inbox')}
+                     <span className="ml-2 text-xs bg-slate-800 text-slate-500 px-2 py-1 rounded-full font-normal">
+                        {filteredTasks.length}
+                     </span>
+                   </h2>
+
+                   {/* Sort Menu */}
+                   <div className="relative">
+                       <button 
+                        onClick={() => setShowSortMenu(!showSortMenu)}
+                        className="flex items-center space-x-1 text-xs text-slate-500 hover:text-slate-300 transition-colors bg-slate-900 px-2 py-1.5 rounded-lg border border-slate-800"
+                       >
+                           <ArrowUpDown size={14} />
+                           <span>Sort</span>
+                       </button>
+                       {showSortMenu && (
+                           <>
+                           <div className="fixed inset-0 z-10" onClick={() => setShowSortMenu(false)}></div>
+                           <div className="absolute right-0 mt-2 w-32 bg-slate-900 border border-slate-700 rounded-lg shadow-xl z-20 py-1">
+                               <button 
+                                onClick={() => { setSortBy('default'); setShowSortMenu(false); }}
+                                className={`w-full text-left px-3 py-2 text-xs hover:bg-slate-800 ${sortBy === 'default' ? 'text-blue-400' : 'text-slate-400'}`}
+                               >
+                                   Default
+                               </button>
+                               <button 
+                                onClick={() => { setSortBy('title'); setShowSortMenu(false); }}
+                                className={`w-full text-left px-3 py-2 text-xs hover:bg-slate-800 ${sortBy === 'title' ? 'text-blue-400' : 'text-slate-400'}`}
+                               >
+                                   Title
+                               </button>
+                               <button 
+                                onClick={() => { setSortBy('estimate'); setShowSortMenu(false); }}
+                                className={`w-full text-left px-3 py-2 text-xs hover:bg-slate-800 ${sortBy === 'estimate' ? 'text-blue-400' : 'text-slate-400'}`}
+                               >
+                                   Time Estimate
+                               </button>
+                               <button 
+                                onClick={() => { setSortBy('duration'); setShowSortMenu(false); }}
+                                className={`w-full text-left px-3 py-2 text-xs hover:bg-slate-800 ${sortBy === 'duration' ? 'text-blue-400' : 'text-slate-400'}`}
+                               >
+                                   Tracked Time
+                               </button>
+                               <button 
+                                onClick={() => { setSortBy('created'); setShowSortMenu(false); }}
+                                className={`w-full text-left px-3 py-2 text-xs hover:bg-slate-800 ${sortBy === 'created' ? 'text-blue-400' : 'text-slate-400'}`}
+                               >
+                                   Created Date
+                               </button>
+                           </div>
+                           </>
+                       )}
+                   </div>
+               </div>
                
                {filteredTasks.length === 0 ? (
                  <div className="text-center py-20 text-slate-600">
-                   <Inbox size={48} className="mx-auto mb-4 opacity-50" />
-                   <p>No tasks here. Tasks will appear after refreshing from Marvin.</p>
+                   {activeTab === TaskStatus.BACKBURNER ? <CookingPot size={48} className="mx-auto mb-4 opacity-50" /> : <Inbox size={48} className="mx-auto mb-4 opacity-50" />}
+                   <p>No tasks here.</p>
                  </div>
                ) : (
                  filteredTasks.map(task => (
@@ -956,6 +1469,7 @@ ${JSON.stringify(tasks.slice(0, 50).map(t => ({
                      onToggleStatus={(id) => markDone(id, 'User clicked checkbox', 'user')}
                      onToggleTimer={(id) => toggleTimer(id, 'User clicked timer', 'user')}
                      onDelete={(id) => deleteTask(id, 'User clicked delete', 'user')}
+                     onUpdateEstimate={updateTaskEstimate}
                    />
                  ))
                )}
@@ -1035,12 +1549,5 @@ ${JSON.stringify(tasks.slice(0, 50).map(t => ({
     </div>
   );
 };
-
-const ClockIcon = () => (
-  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-    <circle cx="12" cy="12" r="10" />
-    <polyline points="12 6 12 12 16 14" />
-  </svg>
-);
 
 export default App;
